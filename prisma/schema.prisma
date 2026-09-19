@@ -1,0 +1,298 @@
+// First Love Telepastoring — data model.
+//
+// The spine is Visitor → Assignment → Call. Everything else exists to support
+// that loop: who may act on a visitor, what was said, and whether follow-up
+// actually happened.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// People who log in
+// ---------------------------------------------------------------------------
+
+enum Role {
+  TELEPASTOR
+  TEAM_LEAD
+  ADMIN
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  members   User[]   @relation("TeamMembers")
+  leader    User?    @relation("TeamLeader", fields: [leaderId], references: [id], onDelete: SetNull)
+  leaderId  String?  @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// The visitor being followed up
+// ---------------------------------------------------------------------------
+
+enum VisitorSource {
+  SERVICE_CARD
+  ONLINE_FORM
+  REFERRAL
+  IMPORT
+}
+
+/// Where the visitor is on their journey. Advanced by hand, not inferred.
+enum VisitorStage {
+  NEW
+  CONTACTED
+  ATTENDING
+  IN_GROUP
+  MEMBER
+  UNREACHABLE
+}
+
+model Visitor {
+  id       String @id @default(cuid())
+  fullName String
+
+  /// Normalised to E.164 on write. This is the de-duplication key: the same
+  /// person filling a card three Sundays running must collapse to one row.
+  phone String @unique
+
+  /// Exactly what was written on the card, kept for when normalisation is wrong.
+  phoneRaw String?
+
+  email        String?
+  gender       String?
+  area         String?
+  firstVisitAt DateTime
+  source       VisitorSource @default(SERVICE_CARD)
+  stage        VisitorStage  @default(NEW)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdBy   User?   @relation("VisitorCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  assignments Assignment[]
+  calls       Call[]
+  notes       Note[]
+
+  @@index([stage])
+  @@index([firstVisitAt])
+}
+
+// ---------------------------------------------------------------------------
+// Assignment: one telepastor owns one visitor's follow-up
+// ---------------------------------------------------------------------------
+
+enum AssignmentStatus {
+  PENDING
+  CALLED
+  CALLBACK
+  CLOSED
+}
+
+model Assignment {
+  id String @id @default(cuid())
+
+  visitor   Visitor @relation(fields: [visitorId], references: [id], onDelete: Cascade)
+  visitorId String
+
+  telepastor   User   @relation("AssignmentTelepastor", fields: [telepastorId], references: [id], onDelete: Cascade)
+  telepastorId String
+
+  assignedBy   User?   @relation("AssignmentAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+  assignedById String?
+
+  status     AssignmentStatus @default(PENDING)
+  assignedAt DateTime         @default(now())
+
+  /// The promise: contacted by this time. Overdue assignments are the whole
+  /// point of the escalation report.
+  dueAt DateTime
+
+  closedAt DateTime?
+
+  calls Call[]
+
+  /// A visitor is only ever open with one telepastor at a time; reassignment
+  /// closes the old row rather than adding a second live one.
+  @@unique([visitorId, telepastorId, assignedAt])
+  @@index([telepastorId, status])
+  @@index([status, dueAt])
+}
+
+// ---------------------------------------------------------------------------
+// The call itself
+// ---------------------------------------------------------------------------
+
+enum CallOutcome {
+  ANSWERED
+  NO_ANSWER
+  CALLBACK
+  WRONG_NUMBER
+}
+
+model Call {
+  id String @id @default(cuid())
+
+  assignment   Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  assignmentId String
+
+  visitor   Visitor @relation(fields: [visitorId], references: [id], onDelete: Cascade)
+  visitorId String
+
+  telepastor   User   @relation("CallTelepastor", fields: [telepastorId], references: [id], onDelete: Cascade)
+  telepastorId String
+
+  outcome         CallOutcome
+  calledAt        DateTime    @default(now())
+  durationSeconds Int         @default(0)
+  summary         String?
+
+  createdAt DateTime @default(now())
+
+  @@index([telepastorId, calledAt])
+  @@index([visitorId, calledAt])
+}
+
+// ---------------------------------------------------------------------------
+// Pastoral notes
+// ---------------------------------------------------------------------------
+
+enum NoteKind {
+  GENERAL
+  PRAYER_REQUEST
+}
+
+model Note {
+  id String @id @default(cuid())
+
+  visitor   Visitor @relation(fields: [visitorId], references: [id], onDelete: Cascade)
+  visitorId String
+
+  author   User?   @relation("NoteAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  authorId String?
+
+  kind NoteKind @default(GENERAL)
+  body String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([visitorId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Who looked at what. Prayer requests are sensitive; reads are worth recording.
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  actor   User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorId String?
+
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  at         DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId, at])
+}
+
+// ---------------------------------------------------------------------------
+// Auth tables (better-auth). Shape is dictated by the library — verify any
+// change with `pnpm exec @better-auth/cli generate` rather than editing freely.
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Application fields.
+  role   Role    @default(TELEPASTOR)
+  phone  String?
+  /// Filled in on the profile step after sign-up.
+  dateOfBirth DateTime?
+  /// Accounts are active as soon as they are created — no approval step.
+  active Boolean @default(true)
+
+  team   Team?   @relation("TeamMembers", fields: [teamId], references: [id], onDelete: SetNull)
+  teamId String?
+  leads  Team?   @relation("TeamLeader")
+
+  sessions Session[]
+  accounts Account[]
+
+  assignments        Assignment[] @relation("AssignmentTelepastor")
+  assignmentsCreated Assignment[] @relation("AssignmentAssignedBy")
+  calls              Call[]       @relation("CallTelepastor")
+  notes              Note[]       @relation("NoteAuthor")
+  visitorsCreated    Visitor[]    @relation("VisitorCreatedBy")
+  auditLogs          AuditLog[]   @relation("AuditActor")
+
+  @@index([teamId])
+  @@index([role, active])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  @@index([userId])
+}
+
+model Account {
+  id         String @id @default(cuid())
+  accountId  String
+  providerId String
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  /// Hashed by better-auth (scrypt). Never a plaintext password.
+  password              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
