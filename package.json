@@ -12,7 +12,8 @@
     "db:generate": "prisma generate",
     "db:studio": "prisma studio",
     "db:seed": "tsx --env-file=.env prisma/seed.ts",
-    "user:make-admin": "tsx --env-file=.env scripts/make-admin.ts"
+    "user:make-admin": "tsx --env-file=.env scripts/make-admin.ts",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.0",
